@@ -1,0 +1,96 @@
+name: Build zygisk-detach
+
+on:
+  push:
+    branches: [ "master", "main" ]
+  pull_request:
+    branches: [ "master", "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Compile and Package
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: aarch64-linux-android, armv7-linux-androideabi, x86_64-linux-android, i686-linux-android
+
+      - name: Install cargo-ndk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+
+      - name: Setup Node.js (WebUI)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Compile KSU WebUI
+        working-directory: ksu-webui
+        run: |
+          npm install
+          npx parcel build src/index.html --dist-dir dist --public-url . --no-source-maps
+
+      - name: Generate NDK Makefiles
+        working-directory: zygisk
+        run: |
+          mkdir -p jni
+          cat << 'EOF' > jni/Android.mk
+          LOCAL_PATH := $(call my-dir)
+          
+          include $(CLEAR_VARS)
+          LOCAL_MODULE := zygisk-detach
+          LOCAL_SRC_FILES := module.cpp
+          LOCAL_CPPFLAGS := -std=c++17 -fno-exceptions -fno-rtti -Wall -Wextra
+          LOCAL_LDLIBS := -llog
+          include $(BUILD_SHARED_LIBRARY)
+          EOF
+          
+          cat << 'EOF' > jni/Application.mk
+          APP_ABI := armeabi-v7a arm64-v8a x86 x86_64
+          APP_PLATFORM := android-21
+          APP_STL := c++_static
+          APP_OPTIM := release
+          EOF
+
+      - name: Compile Zygisk Module
+        working-directory: zygisk
+        run: $ANDROID_NDK_HOME/ndk-build NDK_PROJECT_PATH=. -j$(nproc)
+
+      - name: Compile Rust CLI
+        working-directory: cli
+        run: cargo ndk -t arm64-v8a -t armeabi-v7a -t x86 -t x86_64 build --release
+
+      - name: Package Magisk Module
+        run: |
+          mkdir -p out/zygisk out/bin/arm64 out/bin/arm out/bin/x64 out/bin/x86 out/webroot
+          
+          cp -rf magisk/* out/
+          
+          cp zygisk/libs/armeabi-v7a/libzygisk-detach.so out/zygisk/armeabi-v7a.so
+          cp zygisk/libs/arm64-v8a/libzygisk-detach.so out/zygisk/arm64-v8a.so
+          cp zygisk/libs/x86/libzygisk-detach.so out/zygisk/x86.so
+          cp zygisk/libs/x86_64/libzygisk-detach.so out/zygisk/x86_64.so
+          
+          cp cli/target/aarch64-linux-android/release/cli out/bin/arm64/detach
+          cp cli/target/armv7-linux-androideabi/release/cli out/bin/arm/detach
+          cp cli/target/x86_64-linux-android/release/cli out/bin/x64/detach
+          cp cli/target/i686-linux-android/release/cli out/bin/x86/detach
+          
+          cp -rf ksu-webui/dist/* out/webroot/
+          
+          cd out
+          zip -r9 ../zygisk-detach-release.zip .
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zygisk-detach-magisk-module
+          path: zygisk-detach-release.zip
+          retention-days: 7
