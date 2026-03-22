@@ -29,7 +29,7 @@ static uint32_t getApplicationEnabledSetting_code = 0;
 static inline void detach(PParcel* pparcel, uint32_t code) {
     auto parcel = FakeParcel(pparcel->data);
     if (pparcel->data_size < HEADERS_LEN + 4) return;
-    parcel.skip(HEADERS_LEN);  // header
+    parcel.skip(HEADERS_LEN);
 
     auto descLen = parcel.readInt32();
     auto desc = parcel.readString16(descLen);
@@ -94,12 +94,15 @@ static size_t read_companion(int fd) {
         return 0;
     }
     DETACH_TXT = (char*)malloc(size + 1);
+    if (!DETACH_TXT) return 0;
 
     off_t size_read = 0;
     while (size_read < size) {
-        ssize_t ret = read(fd, DETACH_TXT, size - size_read);
+        ssize_t ret = read(fd, DETACH_TXT + size_read, size - size_read);
         if (ret < 0) {
             LOGD("ERROR read: %s", strerror(errno));
+            free(DETACH_TXT);
+            DETACH_TXT = nullptr;
             return 0;
         } else {
             size_read += ret;
@@ -128,43 +131,6 @@ static bool getBinder(ino_t* inode, dev_t* dev) {
     return false;
 }
 
-static bool run(const char* process, zygisk::Api* api, JNIEnv* env) {
-    if (memcmp(process, VENDING_PROC, STR_LEN(VENDING_PROC)) != 0) return false;
-
-    getApplicationEnabledSetting_code = getStaticIntFieldJni(env, STUB("android/content/pm/IPackageManager"),
-                                                             TRSCTN("getApplicationEnabledSetting"));
-    if (getApplicationEnabledSetting_code == 0) return false;
-
-    int fd = api->connectCompanion();
-    size_t detach_len = read_companion(fd);
-    close(fd);
-    if (detach_len == 0) return false;
-
-    int sdk = android_get_device_api_level();
-    if (sdk <= 0) {
-        LOGD("ERROR android_get_device_api_level: %d", sdk);
-        return false;
-    }
-    HEADERS_LEN = getBinderHeadersLen(sdk);
-
-    ino_t inode;
-    dev_t dev;
-    if (!getBinder(&inode, &dev)) {
-        LOGD("ERROR: Could not get libbinder");
-        return false;
-    }
-
-    api->pltHookRegister(dev, inode, "_ZN7android14IPCThreadState8transactEijRKNS_6ParcelEPS1_j",
-                         (void**)&transact_hook, (void**)&transact_orig);
-    if (!api->pltHookCommit()) {
-        LOGD("ERROR: pltHookCommit");
-        return false;
-    }
-
-    LOGD("Loaded: %s", process);
-    return true;
-}
-
 class ZygiskDetach : public zygisk::ModuleBase {
    public:
     void onLoad(zygisk::Api* api, JNIEnv* env) override {
@@ -174,15 +140,67 @@ class ZygiskDetach : public zygisk::ModuleBase {
 
     void preAppSpecialize(zygisk::AppSpecializeArgs* args) override {
         const char* process = env->GetStringUTFChars(args->nice_name, nullptr);
-        bool r = run(process, api, env);
+        is_vending = (memcmp(process, VENDING_PROC, STR_LEN(VENDING_PROC)) == 0);
         env->ReleaseStringUTFChars(args->nice_name, process);
 
-        if (!r) api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+        if (!is_vending) {
+            api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+            return;
+        }
+
+        int fd = api->connectCompanion();
+        size_t detach_len = read_companion(fd);
+        close(fd);
+
+        if (detach_len == 0) {
+            is_vending = false;
+            api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+            return;
+        }
+
+        if (!getBinder(&inode, &dev)) {
+            LOGD("ERROR: Could not get libbinder");
+            free(DETACH_TXT);
+            DETACH_TXT = nullptr;
+            is_vending = false;
+            api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+            return;
+        }
+
+        int sdk = android_get_device_api_level();
+        if (sdk > 0) {
+            HEADERS_LEN = getBinderHeadersLen(sdk);
+        } else {
+            LOGD("ERROR android_get_device_api_level: %d", sdk);
+            free(DETACH_TXT);
+            DETACH_TXT = nullptr;
+            is_vending = false;
+            api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+        }
+    }
+
+    void postAppSpecialize(const zygisk::AppSpecializeArgs* args) override {
+        if (!is_vending) return;
+
+        getApplicationEnabledSetting_code = getStaticIntFieldJni(env, STUB("android/content/pm/IPackageManager"),
+                                                                 TRSCTN("getApplicationEnabledSetting"));
+        if (getApplicationEnabledSetting_code == 0) return;
+
+        api->pltHookRegister(dev, inode, "_ZN7android14IPCThreadState8transactEijRKNS_6ParcelEPS1_j",
+                             (void**)&transact_hook, (void**)&transact_orig);
+        if (api->pltHookCommit()) {
+            LOGD("Loaded: %s", VENDING_PROC);
+        } else {
+            LOGD("ERROR: pltHookCommit");
+        }
     }
 
    private:
     zygisk::Api* api;
     JNIEnv* env;
+    bool is_vending = false;
+    ino_t inode = 0;
+    dev_t dev = 0;
 };
 
 static void companion_handler(int remote_fd) {
